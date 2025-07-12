@@ -9,6 +9,8 @@ from fastapi import (
     Cookie,
     Response,
     Request,
+    UploadFile,
+    File,
 )
 from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional
@@ -40,7 +42,7 @@ def create_user_table():
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT UNIQUE NOT NULL,
+            user_id INTEGER UNIQUE NOT NULL,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             join_time TEXT NOT NULL,
@@ -61,16 +63,16 @@ def create_submission_table():
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS submissions (
-        id TEXT NOT NULL,
+        id INTEGER NOT NULL,
         problem_id TEXT NOT NULL,
         user_id INTEGER NOT NULL,
         language TEXT NOT NULL,
-        code TEXT NOT NULL,
+        code TEXT,
         status TEXT NOT NULL,
         teststatus TEXT,  
         score INTEGER NOT NULL DEFAULT 10,  
         count INTEGER NOT NULL DEFAULT 0,   
-        create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        create_time TEXT
     )
     """
     )
@@ -114,6 +116,7 @@ class User(BaseModel):
     role: UserRole
     submit_count: int
     resolve_count: int
+    password_hash: str
 
 
 class UserCreate(BaseModel):  # 创建用户时所提交上来的数据结构
@@ -168,14 +171,13 @@ def get_user_by_user_id(user_id: str):
     return None
 
 
-def create_user(
-    user_id: str, username: str, password: str, role: UserRole = UserRole.USER
-):
+def create_initadmin(user_id: str, username: str, password: str, role: UserRole):
     """在数据库中创建用户，利用要求的bcrypt的密码进行加密"""
     password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode(
         "utf-8"
     )
-    join_time = datetime.now().isoformat()
+    now = datetime.now()
+    join_time = now.strftime("%Y-%m-%d")
 
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
@@ -212,7 +214,7 @@ def init_admin_account():
     user_id = get_next_user_id()
 
     if not get_user_by_username(admin_username):
-        create_user(
+        create_initadmin(
             user_id=user_id,
             username=admin_username,
             password=admin_password,
@@ -359,7 +361,8 @@ async def create_admin_user(request: dict, current_user: User = Depends(is_admin
         request.password.encode("utf-8"), bcrypt.gensalt()
     ).decode("utf-8")
 
-    join_time = datetime.now().isoformat()
+    now = datetime.now()
+    join_time = now.strftime("%Y-%m-%d")
 
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
@@ -397,7 +400,10 @@ async def create_user(request: dict):
     password_hash = bcrypt.hashpw(
         request.password.encode("utf-8"), bcrypt.gensalt()
     ).decode("utf-8")
-    join_time = datetime.now().isoformat()
+
+    now = datetime.now()
+    join_time = now.strftime("%Y-%m-%d")
+
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
 
@@ -683,7 +689,7 @@ class Submission(BaseModel):  # 提交类
     teststatus: List[Result] = []  # 测试结果列表
     score: int = 10
     count: int
-    create_time: str
+    create_time: Optional[str] = None
 
 
 class JudgeResult(BaseModel):  # 评测结果类
@@ -944,6 +950,25 @@ def run_judge_in_background(submission_problem_id: str, submission_id: str):
 
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
+    if result.count == len(problem.testcases) * 10:
+        cursor.execute(
+            """
+        SELECT 1 FROM submissions 
+        WHERE problem_id = ? 
+          AND user_id = ? 
+          AND count = ?
+    """,
+            (problem.id, user_id, len(problem.testcases) * 10),
+        )
+        achistory = cursor.fetchone()
+        if achistory is None:
+            cursor.execute(
+                "UPDATE users SET resolve_count = resolve_count + 1 WHERE user_id = ?",
+                (user_id,),
+            )
+
+        conn.commit()
+
     try:
         # 将teststatus列表转为JSON字符串存储
         teststatus_json = json.dumps([r.model_dump() for r in result.teststatus])
@@ -991,11 +1016,12 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
     last_submission = cursor.fetchone()
     if last_submission:
         lasttime = last_submission[0]
-        lasttime = datetime.fromisoformat(lasttime)
-        currenttime = datetime.now()
-        interval = (currenttime - lasttime).total_seconds()
-        if interval < 5:
-            raise HTTPException(status_code=429, detail="提交频率超限")
+        if lasttime is not None:
+            lasttime = datetime.fromisoformat(lasttime)
+            currenttime = datetime.now()
+            interval = (currenttime - lasttime).total_seconds()
+            if interval < 5:
+                raise HTTPException(status_code=429, detail="提交频率超限")
 
     file = open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\app\count.txt",
@@ -1029,6 +1055,15 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
                 10,
                 create_time,
             ),
+        )
+
+        cursor.execute(
+            """
+            UPDATE users 
+            SET submit_count = submit_count + 1 
+            WHERE user_id = ?
+        """,
+            (current_user.user_id,),
         )
         conn.commit()
 
@@ -1250,10 +1285,10 @@ async def rejudge_submission(
         SET status = ?, 
             teststatus = NULL, 
             count = 0,
-            create_time = CURRENT_TIMESTAMP  
+            create_time = ? 
         WHERE id = ?
     """,
-        (SubmissionStatus.PENDING, submission_id),
+        (SubmissionStatus.PENDING, datetime.now().isoformat(), submission_id),
     )
 
     threading.Thread(target=run_judge_in_background, args=(problem_id, id)).start()
@@ -1262,3 +1297,224 @@ async def rejudge_submission(
         "msg": "rejudge started",
         "data": {"submission_id": newsubmission.id, "status": newsubmission.status},
     }
+
+
+@app.post("/api/reset/")
+async def reset(current_user: User = Depends(is_admin)):
+    os.remove(DATABASE_PATH)
+    with open(
+        r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\users\user_count.txt",
+        "w",
+        encoding="utf-8",
+    ) as f:
+        f.write(str(0))
+
+    with open(
+        r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\app\count.txt",
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write(str(0))
+
+    for item in os.listdir(SESSIONS_DIR):
+        item_path = os.path.join(SESSIONS_DIR, item)
+        os.remove(item_path)
+
+    for item in os.listdir(SESSIONS_DIR):
+        item_path = os.path.join(SESSIONS_DIR, item)
+        os.remove(item_path)
+
+    for item in os.listdir(PROBLEMS_DIR):
+        item_path = os.path.join(PROBLEMS_DIR, item)
+        os.remove(item_path)
+
+    create_user_table()
+    create_submission_table()
+    init_admin_account()
+
+    return {"code": 200, "msg": "system reset successfully", "data": "null"}
+
+
+@app.get("/api/export")
+async def export(current_user: User = Depends(is_admin)):
+    try:
+
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM users")
+        users = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute("SELECT * FROM submissions")
+        submissions = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        problems = []
+
+        for filename in os.listdir(PROBLEMS_DIR):
+            if filename.endswith(".json"):
+                path = os.path.join(PROBLEMS_DIR, filename)
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    problems.append(data)
+
+        return {"users": users, "problems": problems, "submissions": submissions}
+
+    except Exception:
+        raise HTTPException(status_code=500, detail="服务器服务异常")
+
+
+def import_problem(problem: Problem):
+    pass
+
+
+def import_user(user: User):
+    """导入用户数据，冲突时更新"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+
+    try:
+
+        cursor.execute(
+            """
+            INSERT INTO users (user_id, username, password_hash, join_time, role, submit_count, resolve_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user.user_id,
+                user.username,
+                user.password_hash,
+                user.join_time,
+                user.role,
+                user.submit_count,
+                user.resolve_count,
+            ),
+        )
+    except sqlite3.IntegrityError:
+
+        cursor.execute(
+            """
+            UPDATE users
+            SET username = ?,
+                password_hash = ?,
+                join_time = ?,
+                role = ?,
+                submit_count = ?,
+                resolve_count = ?
+            WHERE id = ?
+            """,
+            (
+                user.username,
+                user.password_hash,
+                user.join_time,
+                user.role,
+                user.submit_count,
+                user.resolve_count,
+                user.user_id,
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def import_submission(submission: Submission):
+    """导入提交数据，冲突时更新"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    teststatus_json = json.dumps([r.model_dump() for r in submission.teststatus])
+    try:
+
+        cursor.execute(
+            """
+            INSERT INTO submissions (id, problem_id, user_id, language, code, status, teststatus, score, count, create_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                submission.id,
+                submission.problem_id,
+                submission.user_id,
+                submission.language,
+                submission.code,
+                submission.status,
+                teststatus_json,
+                submission.score,
+                submission.count,
+                submission.create_time,
+            ),
+        )
+
+    except sqlite3.IntegrityError:
+
+        cursor.execute(
+            """
+            UPDATE submissions
+            SET problem_id = ?,
+                user_id = ?,
+                language = ?,
+                code = ?,
+                status = ?,
+                teststatus = ?,
+                score = ?,
+                count = ?,
+                create_time = ?
+            WHERE id = ?
+            """,
+            (
+                submission.problem_id,
+                submission.user_id,
+                submission.language,
+                submission.code,
+                submission.status,
+                teststatus_json,
+                submission.score,
+                submission.count,
+                submission.create_time,
+                submission.id,
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+@app.post("/api/import/")
+async def impo(file: UploadFile = File(...), current_user: User = Depends(is_admin)):
+    if not file.filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="Only JSON files supported")
+
+    content = await file.read()
+    data = json.loads(content.decode("utf-8"))
+
+    type = 0
+
+    try:
+        type = 1
+        problem = Problem(**data)
+    except Exception:
+        try:
+            type = 2
+            user = User(**data)
+        except Exception:
+            try:
+                type = 3
+                submission = Submission(**data)
+            except Exception:
+                raise HTTPException(status_code=400, detail="参数错误")
+
+    try:
+        if type == 1:
+            # 处理Problem类型数据
+            import_problem(problem)
+        elif type == 2:
+            # 处理User类型数据
+            import_user(user)
+        elif type == 3:
+            # 处理Submission类型数据
+            import_submission(submission)
+
+        return {"code": 200, "msg": "import success", "data": "null"}
+    except Exception:
+
+        raise HTTPException(status_code=500, detail="服务器异常")
