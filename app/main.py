@@ -4,7 +4,6 @@ import uvicorn
 from fastapi import (
     FastAPI,
     HTTPException,
-    status,
     Query,
     Depends,
     Cookie,
@@ -15,7 +14,6 @@ from pydantic import BaseModel, Field, ValidationError
 from typing import List, Optional
 from enum import Enum
 import threading
-from fastapi.exceptions import RequestValidationError
 import subprocess
 import tempfile
 import psutil
@@ -56,10 +54,33 @@ def create_user_table():
     conn.close()
 
 
+def create_submission_table():
+    """创建提交记录表"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS submissions (
+        id TEXT NOT NULL,
+        problem_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        language TEXT NOT NULL,
+        code TEXT NOT NULL,
+        status TEXT NOT NULL,
+        teststatus TEXT,  
+        score INTEGER NOT NULL DEFAULT 10,  
+        count INTEGER NOT NULL DEFAULT 0,   
+        create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+    conn.commit()
+    conn.close()
+
+
 app = FastAPI()
 PROBLEMS_DIR = r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\problems"
 LANGUAGES_DIR = r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\languages"
-SUBMISSIONS_DIR = r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\submissions"
 TEMP_DIR = r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\temp"
 USERS_DIR = r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\users"
 SESSIONS_DIR = r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\sessions"
@@ -73,11 +94,6 @@ def get_problem_path(problem_id):
 def get_language_path(language_name):
     """获取语言路径"""
     return os.path.join(LANGUAGES_DIR, f"{language_name}.json")
-
-
-def get_submission_path(submission_id):
-    """获取提交文件路径"""
-    return os.path.join(SUBMISSIONS_DIR, f"{submission_id}.json")
 
 
 @app.get("/")
@@ -188,7 +204,7 @@ def create_user(
 def init_admin_account():
     """建立初始管理员账号，如果已经存在就直接return，防止因为服务器重启而建立多个初始管理员"""
     admin_username = "admin"
-    admin_password = "adminpassword"
+    admin_password = "admin"
     existing_admin = get_user_by_username(admin_username)
     if existing_admin:
         return
@@ -218,6 +234,7 @@ def get_next_user_id():
 
 
 create_user_table()  # 创建用户表
+create_submission_table()  # 创建提交表
 init_admin_account()  # 初始化管理员
 
 
@@ -610,7 +627,7 @@ class Language(BaseModel):  # 语言类
     memory_limit: Optional[int] = None
 
 
-@app.post("/api/languages/", status_code=status.HTTP_201_CREATED)
+@app.post("/api/languages/")
 async def register_language(request: dict, current_user: User = Depends(is_admin)):
     """注册新编程语言"""
 
@@ -666,6 +683,7 @@ class Submission(BaseModel):  # 提交类
     teststatus: List[Result] = []  # 测试结果列表
     score: int = 10
     count: int
+    create_time: str
 
 
 class JudgeResult(BaseModel):  # 评测结果类
@@ -682,7 +700,7 @@ def run_process(
     work_dir: str,
 ) -> tuple[str, str, float, float, bool]:
     """运行进程并监控资源使用"""
-    max_memory = 0  # 内存峰值（字节）
+    max_memory = 0
     timed_out = False
     memory_exceeded = False
     start_time = time.time()
@@ -693,8 +711,7 @@ def run_process(
             proc = psutil.Process(process_pid)
             while True:
                 try:
-                    mem_info = proc.memory_info()
-                    current_mem = mem_info.rss  # 常驻内存大小
+                    current_mem = proc.memory_info().rss
 
                     if current_mem > max_memory:
                         max_memory = current_mem
@@ -716,7 +733,7 @@ def run_process(
             pass
 
     try:
-        # 启动进程
+
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -727,12 +744,10 @@ def run_process(
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
 
-        # 启动内存监控线程
         monitor_thread = threading.Thread(target=memory_monitor, args=(process.pid,))
         monitor_thread.daemon = True
         monitor_thread.start()
 
-        # 向进程提供输入并获取输出
         try:
             stdout, stderr = process.communicate(
                 input=input_data, timeout=time_limit + 0.5
@@ -742,16 +757,13 @@ def run_process(
             process.terminate()
             stdout, stderr = process.communicate()
 
-        # 等待监控线程结束
         monitor_thread.join(timeout=0.1)
 
-        # 计算运行时间
         run_time = time.time() - start_time
 
-        # 计算内存使用（MB）
         memory_used = max_memory / (1024 * 1024) if max_memory > 0 else 0
 
-        return stdout, stderr, run_time, memory_used, timed_out or memory_exceeded
+        return stdout, run_time, memory_used, timed_out or memory_exceeded
 
     except Exception as e:
         raise RuntimeError(f"Process execution failed: {str(e)}")
@@ -767,17 +779,14 @@ def normalize_output(output: str):
     return "\n".join(lines) + "\n" if lines else ""
 
 
-def compare_output(actual: str, expected: str):
-    """比较两个输出是否一致"""
-    return normalize_output(actual) == normalize_output(expected)
-
-
 def judge_submission(problem: Problem, code: str, language: str):
     """评测提交的代码"""
     lang_path = get_language_path(language)
     if not os.path.exists(lang_path):
         test_status = []
-        for i in range(len(problem.testcases)):
+        for i in range(
+            len(problem.testcases)
+        ):  # TODO:这里的实现就比较烂了，和后面的CE一样
             test_status.append(Result(i + 1, TestStatus.UNK))
         return JudgeResult(
             teststatus=test_status, count=0, status=SubmissionStatus.SUCCESS
@@ -788,7 +797,7 @@ def judge_submission(problem: Problem, code: str, language: str):
 
     # 创建临时工作目录
     with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temp_dir:
-        work_dir = temp_dir  # 直接使用字符串路径
+        work_dir = temp_dir
 
         # 保存源代码
         source_path = os.path.join(work_dir, f"main.{lang_config.file_ext}")
@@ -797,9 +806,9 @@ def judge_submission(problem: Problem, code: str, language: str):
 
         executable_path = None
         if lang_config.compile_cmd:
-            # 编译代码
+
             executable_path = os.path.join(work_dir, "main")
-            # 格式化编译命令
+
             compile_cmd = lang_config.compile_cmd.format(
                 src=source_path, exe=executable_path
             ).split()
@@ -816,7 +825,9 @@ def judge_submission(problem: Problem, code: str, language: str):
                 if compile_result.returncode != 0:
                     test_status = []
                     for i in range(len(problem.testcases)):
-                        test_status.append(Result(i + 1, TestStatus.COMPILATION_ERROR))
+                        test_status.append(
+                            Result(i + 1, TestStatus.COMPILATION_ERROR)
+                        )  # TODO:这里实现比较烂，直接读取题目testcases的长度，然后将评测点信息直接加入返回
 
                     return JudgeResult(
                         teststatus=test_status,
@@ -842,15 +853,14 @@ def judge_submission(problem: Problem, code: str, language: str):
                     count=0,
                 )
 
-        # 准备运行命令
         run_cmd = lang_config.run_cmd.format(
             src=source_path, exe=executable_path if executable_path else ""
         ).split()
 
-        # 使用题目限制或语言默认限制
         time_limit = min(
             problem.time_limit, lang_config.time_limit
         )  # 选择题目限时和语言限时中最小的
+        # ?暂时还不确定这里的逻辑，api文档里没有说
         memory_limit = min(
             problem.memory_limit, lang_config.memory_limit
         )  # 选择题目内存限制和语言内存限制中最小的
@@ -863,7 +873,7 @@ def judge_submission(problem: Problem, code: str, language: str):
 
             try:
                 # 运行并监控进程
-                stdout, stderr, run_time, memory_used, resource_exceeded = run_process(
+                stdout, run_time, memory_used, resource_exceeded = run_process(
                     run_cmd, test_case.input, time_limit, memory_limit, work_dir
                 )
 
@@ -884,7 +894,7 @@ def judge_submission(problem: Problem, code: str, language: str):
                     continue
 
                 # 检查运行结果
-                if not compare_output(stdout, test_case.output):
+                if not normalize_output(stdout) == normalize_output(test_case.output):
                     result.status = TestStatus.WRONG_ANSWER
                     result.time = run_time
                     result.memory = memory_used
@@ -896,7 +906,7 @@ def judge_submission(problem: Problem, code: str, language: str):
                 result.time = run_time
                 result.memory = memory_used
 
-            except Exception as e:
+            except Exception:
                 result.status = TestStatus.RUNTIME_ERROR
 
             test_status.append(result)
@@ -911,21 +921,45 @@ def judge_submission(problem: Problem, code: str, language: str):
 def run_judge_in_background(submission_problem_id: str, submission_id: str):
     """后台运行评测任务"""
     problem_path = get_problem_path(submission_problem_id)
-    submission_path = get_submission_path(submission_id)
-    print(submission_path)
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT user_id, language, code FROM submissions WHERE id = ?
+    """,
+        (submission_id,),
+    )
+    submission_data = cursor.fetchone()
+    conn.close()
+    if not submission_data:
+        return  # 提交不存在，直接返回
+
+    user_id, language, code = submission_data
+
     with open(problem_path, "r+", encoding="utf-8") as f:
         problem = Problem(**json.load(f))
 
-    with open(submission_path, "r+", encoding="utf-8") as f:
-        submission = Submission(**json.load(f))
+    result = judge_submission(problem, code, language)
 
-    result = judge_submission(problem, submission.code, submission.language)
-    submission.status = result.status
-    submission.count = result.count
-    submission.teststatus = result.teststatus
-
-    with open(submission_path, "w", encoding="utf-8") as f:
-        json.dump(submission.model_dump(), f)
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    try:
+        # 将teststatus列表转为JSON字符串存储
+        teststatus_json = json.dumps([r.model_dump() for r in result.teststatus])
+        cursor.execute(
+            """
+        UPDATE submissions SET 
+        status = ?, 
+        teststatus = ?, 
+        count = ?
+        WHERE id = ?
+        """,
+            (result.status, teststatus_json, result.count, submission_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 @app.post("/api/submissions/")
@@ -941,6 +975,28 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="题目不存在")
 
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+            SELECT create_time 
+            FROM submissions 
+            WHERE user_id = ? 
+            ORDER BY id DESC 
+            LIMIT 1
+        """,
+        (current_user.user_id,),
+    )
+    last_submission = cursor.fetchone()
+    if last_submission:
+        lasttime = last_submission[0]
+        lasttime = datetime.fromisoformat(lasttime)
+        currenttime = datetime.now()
+        interval = (currenttime - lasttime).total_seconds()
+        if interval < 5:
+            raise HTTPException(status_code=429, detail="提交频率超限")
+
     file = open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\app\count.txt",
         "r+",
@@ -951,7 +1007,34 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
     file.truncate()
     content += 1
 
-    # 创建提交记录
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    create_time = datetime.now().isoformat()
+    try:
+        # 插入提交记录（初始状态为pending）
+
+        cursor.execute(
+            """
+        INSERT INTO submissions 
+        (id, problem_id, user_id, language, code, status, score, create_time)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                content,
+                request.problem_id,
+                current_user.user_id,
+                request.language,
+                request.code,
+                SubmissionStatus.PENDING,
+                10,
+                create_time,
+            ),
+        )
+        conn.commit()
+
+    finally:
+        conn.close()
+
     submission = Submission(
         id=content,
         problem_id=request.problem_id,
@@ -961,13 +1044,10 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
         status=SubmissionStatus.PENDING,
         score=10,
         count=0,
+        create_time=create_time,
     )
     file.write(str(content))
     file.close()
-    file_path = get_submission_path(content)
-    sub_config = submission.model_dump()
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(sub_config, f)
 
     # 启动后台评测任务
     threading.Thread(
@@ -986,26 +1066,31 @@ async def get_submission_result(
     submission_id: str, current_user: User = Depends(get_current_user)
 ):
     """获取评测结果"""
-    submission_path = get_submission_path(submission_id)
-    if not os.path.exists(submission_path):
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+    SELECT user_id, status, score, count FROM submissions WHERE id = ?
+    """,
+        (submission_id,),
+    )
+    submission_data = cursor.fetchone()
+    conn.close()
+
+    if not submission_data:
         raise HTTPException(status_code=404, detail="评测不存在")
 
-    with open(submission_path, "r", encoding="utf-8") as f:
-        submission = Submission(**json.load(f))
-
-    if (
-        submission.user_id != current_user.user_id
-        and not current_user.role == UserRole.ADMIN
-    ):
+    user_id, status, score, count = submission_data
+    if user_id != current_user.user_id and not current_user.role == UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="权限不足")
 
     return {
         "code": 200,
         "msg": "success",
         "data": {
-            "status": submission.status,
-            "score": submission.score,
-            "count": submission.count,
+            "status": status,
+            "score": score,
+            "count": count,
         },
     }
 
@@ -1018,16 +1103,51 @@ def get_submissions(
     page_size: int = 20,
 ) -> Tuple[int, List[Submission]]:
     """获取提交列表"""
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+            SELECT id, problem_id, user_id, language, code, status, teststatus, score, count,create_time
+            FROM submissions
+            
+        """
+    )
+    rows = cursor.fetchall()
     submissions = []
-    for filename in os.listdir(SUBMISSIONS_DIR):
-        if filename.endswith(".json"):
-            path = os.path.join(SUBMISSIONS_DIR, filename)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    submissions.append(Submission(**data))
-            except:
-                continue
+    for row in rows:
+        (
+            id,
+            problem_id,
+            user_id,
+            language,
+            code,
+            status,
+            teststatus_json,
+            score,
+            count,
+            create_time,
+        ) = row
+
+        teststatus_data = json.loads(teststatus_json)
+        teststatus = [Result(**item) for item in teststatus_data]
+        submissions.append(
+            Submission(
+                id=id,
+                problem_id=problem_id,
+                user_id=user_id,
+                language=language,
+                code=code,
+                status=status,
+                teststatus=teststatus,
+                score=score,
+                count=count,
+                create_time=create_time,
+            )
+        )
+
+    conn.close()
 
     filtered = []
     for sub in submissions:
@@ -1095,30 +1215,48 @@ async def rejudge_submission(
     submission_id: str, current_user: User = Depends(is_admin)
 ):
     """重新评测"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, problem_id, user_id, language, code 
+        FROM submissions 
+        WHERE id = ?
+    """,
+        (submission_id,),
+    )
 
-    file_path = get_submission_path(submission_id)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Submission not found")
+    submission_data = cursor.fetchone()
 
-    with open(file_path, "r+", encoding="utf-8") as f:
-        submission = Submission(**json.load(f))
+    if not submission_data:
+        raise HTTPException(status_code=404, detail="评测不存在")
+
+    id, problem_id, user_id, language, code = submission_data
 
     newsubmission = Submission(
-        id=submission.id,
-        problem_id=submission.problem_id,
-        user_id=submission.user_id,
-        language=submission.language,
-        code=submission.code,
+        id=id,
+        problem_id=problem_id,
+        user_id=user_id,
+        language=language,
+        code=code,
         status=SubmissionStatus.PENDING,
         score=10,
         count=0,
     )
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(newsubmission.model_dump(), f)
 
-    threading.Thread(
-        target=run_judge_in_background, args=(submission.problem_id, submission.id)
-    ).start()
+    cursor.execute(
+        """
+        UPDATE submissions 
+        SET status = ?, 
+            teststatus = NULL, 
+            count = 0,
+            create_time = CURRENT_TIMESTAMP  
+        WHERE id = ?
+    """,
+        (SubmissionStatus.PENDING, submission_id),
+    )
+
+    threading.Thread(target=run_judge_in_background, args=(problem_id, id)).start()
     return {
         "code": 200,
         "msg": "rejudge started",
