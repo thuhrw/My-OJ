@@ -26,6 +26,7 @@ from datetime import datetime
 import bcrypt
 import uuid
 import sqlite3
+from json import JSONDecodeError
 
 DATABASE_PATH = "app.db"
 
@@ -70,10 +71,30 @@ def create_submission_table():
         code TEXT,
         status TEXT NOT NULL,
         teststatus TEXT,  
-        score INTEGER NOT NULL DEFAULT 10,  
-        count INTEGER NOT NULL DEFAULT 0,   
+        score INTEGER NOT NULL DEFAULT 0,  
+        counts INTEGER NOT NULL DEFAULT 0,   
         create_time TEXT
     )
+    """
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_access_log_table():
+    """创建访问审计日志表"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,  
+            problem_id TEXT,
+            action TEXT NOT NULL,
+            time TEXT NOT NULL,
+            status TEXT NOT NULL
+        )
     """
     )
     conn.commit()
@@ -237,6 +258,7 @@ def get_next_user_id():
 
 create_user_table()  # 创建用户表
 create_submission_table()  # 创建提交表
+create_access_log_table()  # 创建访问审计日志表
 init_admin_account()  # 初始化管理员
 
 
@@ -344,7 +366,7 @@ async def logout(request: Request, response: Response):
     # 清除客户端cookie
     response.delete_cookie(key="session_id")
 
-    return {"code": 200, "msg": "logout success", "data": "null"}
+    return {"code": 200, "msg": "logout success", "data": None}
 
 
 @app.post("/api/users/admin")
@@ -429,7 +451,7 @@ async def create_user(request: dict):
 
     return {
         "code": 200,
-        "msg": "success",
+        "msg": "register success",
         "data": {"user_id": user_id, "username": request.username},
     }
 
@@ -479,7 +501,11 @@ async def update_user_role(
 
 
 @app.get("/api/users/")
-async def list_users(page: int, page_size: int, current_user: User = Depends(is_admin)):
+async def list_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    current_user: User = Depends(is_admin),
+):
     """获取用户列表"""
     if page < 1:
         raise HTTPException(status_code=400, detail="参数错误")
@@ -516,6 +542,7 @@ async def list_users(page: int, page_size: int, current_user: User = Depends(is_
                 "user_id": user[0],
                 "username": user[1],
                 "join_time": user[2],
+                "role": user[3],
                 "submit_count": user[4],
                 "resolve_count": user[5],
             }
@@ -541,8 +568,8 @@ class TestStatus(str, Enum):  # 测试点状态类
 
 
 class Result(BaseModel):  # 单个测试点返回的评测结果类
-    caseid: int
-    status: TestStatus
+    id: int
+    result: TestStatus
     time: Optional[float] = None  # 单个测试用例的运行时间
     memory: Optional[float] = None  # 单个测试用例的内存
 
@@ -568,6 +595,7 @@ class Problem(BaseModel):  # 题目类
     tags: Optional[List[str]] = None
     author: Optional[str] = None
     difficulty: Optional[str] = None
+    is_public: Optional[bool] = False
 
 
 @app.get("/api/problems/")
@@ -613,14 +641,19 @@ async def delete_problem(problem_id: str, user: User = Depends(is_admin)):
 
 
 @app.get("/api/problems/{problem_id}")
-async def get_problem(problem_id: str):
+async def get_problem(problem_id: str, user: User = Depends(get_current_user)):
     """获取题目详情"""
     file_path = get_problem_path(problem_id)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="题目不存在")
 
     with open(file_path, "r", encoding="utf-8") as f:
-        return {"code": 200, "msg": "success", "data": json.load(f)}
+        data = json.load(f)
+
+    if data["is_public"] == False and user.role != UserRole.ADMIN:
+        data.pop("testcases", None)
+
+    return {"code": 200, "msg": "success", "data": data}
 
 
 class Language(BaseModel):  # 语言类
@@ -639,10 +672,13 @@ async def register_language(request: dict, current_user: User = Depends(is_admin
 
     try:
         request = Language(**request)
-    except ValidationError as e:
+    except ValidationError:
         raise HTTPException(status_code=400, detail="参数错误")
 
     file_path = get_language_path(request.name)
+    if os.path.exists(file_path):
+        raise HTTPException(status_code=400, detail="语言已存在")
+
     lang_config = request.model_dump()
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(lang_config, f)
@@ -668,7 +704,7 @@ async def list_languages():
 
 
 class SubmissionStatus(str, Enum):  # 提交的状态类
-    PENDING = "pending"
+    PENDING = "Pending"
     SUCCESS = "success"
     ERROR = "error"
 
@@ -687,15 +723,16 @@ class Submission(BaseModel):  # 提交类
     code: str
     status: SubmissionStatus
     teststatus: List[Result] = []  # 测试结果列表
-    score: int = 10
-    count: int
+    score: int = 0
+    counts: int
     create_time: Optional[str] = None
 
 
 class JudgeResult(BaseModel):  # 评测结果类
     teststatus: List[Result] = []
     status: SubmissionStatus
-    count: int
+    score: int
+    counts: int
 
 
 def run_process(
@@ -787,6 +824,7 @@ def normalize_output(output: str):
 
 def judge_submission(problem: Problem, code: str, language: str):
     """评测提交的代码"""
+    count = len(problem.testcases) * 10  # 每个测试点10分
     lang_path = get_language_path(language)
     if not os.path.exists(lang_path):
         test_status = []
@@ -795,7 +833,10 @@ def judge_submission(problem: Problem, code: str, language: str):
         ):  # TODO:这里的实现就比较烂了，和后面的CE一样
             test_status.append(Result(i + 1, TestStatus.UNK))
         return JudgeResult(
-            teststatus=test_status, count=0, status=SubmissionStatus.SUCCESS
+            teststatus=test_status,
+            score=0,
+            counts=count,
+            status=SubmissionStatus.SUCCESS,
         )
 
     with open(lang_path, "r", encoding="utf-8") as f:
@@ -838,7 +879,8 @@ def judge_submission(problem: Problem, code: str, language: str):
                     return JudgeResult(
                         teststatus=test_status,
                         status=SubmissionStatus.SUCCESS,
-                        count=0,
+                        score=0,
+                        counts=count,
                     )
             except subprocess.TimeoutExpired:
                 test_status = []
@@ -847,7 +889,8 @@ def judge_submission(problem: Problem, code: str, language: str):
                 return JudgeResult(
                     teststatus=test_status,
                     status=SubmissionStatus.SUCCESS,
-                    count=0,
+                    score=0,
+                    counts=count,
                 )
             except Exception as e:
                 test_status = []
@@ -856,7 +899,8 @@ def judge_submission(problem: Problem, code: str, language: str):
                 return JudgeResult(
                     teststatus=test_status,
                     status=SubmissionStatus.SUCCESS,
-                    count=0,
+                    score=0,
+                    counts=count,
                 )
 
         run_cmd = lang_config.run_cmd.format(
@@ -870,12 +914,13 @@ def judge_submission(problem: Problem, code: str, language: str):
         memory_limit = min(
             problem.memory_limit, lang_config.memory_limit
         )  # 选择题目内存限制和语言内存限制中最小的
-
-        total_score = 0
+        total_count = 0  # 总共分数
+        total_score = 0  # 总得分
         test_status = []
         for idx, test_case in enumerate(problem.testcases):
+            total_count += 10
 
-            result = Result(caseid=idx + 1, status=TestStatus.ACCEPTED)
+            result = Result(id=idx + 1, result=TestStatus.ACCEPTED)
 
             try:
                 # 运行并监控进程
@@ -886,12 +931,12 @@ def judge_submission(problem: Problem, code: str, language: str):
                 # 检查资源使用情况
                 if resource_exceeded:
                     if memory_used > memory_limit:
-                        result.status = TestStatus.MEMORY_LIMIT_EXCEEDED
+                        result.result = TestStatus.MEMORY_LIMIT_EXCEEDED
                         result.memory = memory_used
                         result.time = run_time
 
                     else:
-                        result.status = TestStatus.TIME_LIMIT_EXCEEDED
+                        result.result = TestStatus.TIME_LIMIT_EXCEEDED
                         result.time = run_time
                         result.memory = memory_used
 
@@ -901,7 +946,7 @@ def judge_submission(problem: Problem, code: str, language: str):
 
                 # 检查运行结果
                 if not normalize_output(stdout) == normalize_output(test_case.output):
-                    result.status = TestStatus.WRONG_ANSWER
+                    result.result = TestStatus.WRONG_ANSWER
                     result.time = run_time
                     result.memory = memory_used
                     test_status.append(result)
@@ -913,14 +958,15 @@ def judge_submission(problem: Problem, code: str, language: str):
                 result.memory = memory_used
 
             except Exception:
-                result.status = TestStatus.RUNTIME_ERROR
+                result.result = TestStatus.RUNTIME_ERROR
 
             test_status.append(result)
 
         return JudgeResult(
             teststatus=test_status,
             status=SubmissionStatus.SUCCESS,
-            count=total_score,
+            score=total_score,
+            counts=total_count,
         )
 
 
@@ -949,38 +995,42 @@ def run_judge_in_background(submission_problem_id: str, submission_id: str):
     result = judge_submission(problem, code, language)
 
     conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-    if result.count == len(problem.testcases) * 10:
-        cursor.execute(
-            """
-        SELECT 1 FROM submissions 
-        WHERE problem_id = ? 
-          AND user_id = ? 
-          AND count = ?
-    """,
-            (problem.id, user_id, len(problem.testcases) * 10),
-        )
-        achistory = cursor.fetchone()
-        if achistory is None:
-            cursor.execute(
-                "UPDATE users SET resolve_count = resolve_count + 1 WHERE user_id = ?",
-                (user_id,),
-            )
-
-        conn.commit()
-
     try:
+        cursor = conn.cursor()
+        if result.score == len(problem.testcases) * 10:
+            cursor.execute(
+                """
+            SELECT 1 FROM submissions 
+            WHERE problem_id = ? 
+            AND user_id = ? 
+            AND score = ?
+        """,
+                (problem.id, user_id, len(problem.testcases) * 10),
+            )
+            achistory = cursor.fetchone()
+            if achistory is None:
+                cursor.execute(
+                    "UPDATE users SET resolve_count = resolve_count + 1 WHERE user_id = ?",
+                    (user_id,),
+                )
         # 将teststatus列表转为JSON字符串存储
         teststatus_json = json.dumps([r.model_dump() for r in result.teststatus])
         cursor.execute(
             """
         UPDATE submissions SET 
         status = ?, 
-        teststatus = ?, 
-        count = ?
+        teststatus = ?,
+        score = ? ,
+        counts = ?
         WHERE id = ?
         """,
-            (result.status, teststatus_json, result.count, submission_id),
+            (
+                result.status,
+                teststatus_json,
+                result.score,
+                result.counts,
+                submission_id,
+            ),
         )
         conn.commit()
     finally:
@@ -1021,7 +1071,10 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
             currenttime = datetime.now()
             interval = (currenttime - lasttime).total_seconds()
             if interval < 5:
+                conn.close()
                 raise HTTPException(status_code=429, detail="提交频率超限")
+
+    conn.close()
 
     file = open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\app\count.txt",
@@ -1052,7 +1105,7 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
                 request.language,
                 request.code,
                 SubmissionStatus.PENDING,
-                10,
+                0,
                 create_time,
             ),
         )
@@ -1077,8 +1130,8 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
         language=request.language,
         code=request.code,
         status=SubmissionStatus.PENDING,
-        score=10,
-        count=0,
+        score=0,
+        counts=0,
         create_time=create_time,
     )
     file.write(str(content))
@@ -1105,7 +1158,7 @@ async def get_submission_result(
     cursor = conn.cursor()
     cursor.execute(
         """
-    SELECT user_id, status, score, count FROM submissions WHERE id = ?
+    SELECT user_id, status, score, counts FROM submissions WHERE id = ?
     """,
         (submission_id,),
     )
@@ -1115,7 +1168,7 @@ async def get_submission_result(
     if not submission_data:
         raise HTTPException(status_code=404, detail="评测不存在")
 
-    user_id, status, score, count = submission_data
+    user_id, status, score, counts = submission_data
     if user_id != current_user.user_id and not current_user.role == UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="权限不足")
 
@@ -1125,7 +1178,7 @@ async def get_submission_result(
         "data": {
             "status": status,
             "score": score,
-            "count": count,
+            "counts": counts,
         },
     }
 
@@ -1144,7 +1197,7 @@ def get_submissions(
 
     cursor.execute(
         """
-            SELECT id, problem_id, user_id, language, code, status, teststatus, score, count,create_time
+            SELECT id, problem_id, user_id, language, code, status, teststatus, score, counts,create_time
             FROM submissions
             
         """
@@ -1161,12 +1214,15 @@ def get_submissions(
             status,
             teststatus_json,
             score,
-            count,
+            counts,
             create_time,
         ) = row
 
-        teststatus_data = json.loads(teststatus_json)
-        teststatus = [Result(**item) for item in teststatus_data]
+        if teststatus_json is not None:
+            teststatus_data = json.loads(teststatus_json)
+            teststatus = [Result(**item) for item in teststatus_data]
+        else:
+            teststatus = []
         submissions.append(
             Submission(
                 id=id,
@@ -1177,7 +1233,7 @@ def get_submissions(
                 status=status,
                 teststatus=teststatus,
                 score=score,
-                count=count,
+                counts=counts,
                 create_time=create_time,
             )
         )
@@ -1212,7 +1268,7 @@ async def list_submissions(
     """获取提交列表"""
 
     if current_user.user_id != user_id:
-        user_id = current_user.id
+        user_id = current_user.user_id
 
     total, submissions = get_submissions(
         user_id=user_id,
@@ -1232,7 +1288,7 @@ async def list_submissions(
                     "submission_id": sub.id,
                     "status": sub.status,
                     "score": sub.score,
-                    "count": sub.count,
+                    "counts": sub.counts,
                 }
             )
     return {
@@ -1264,6 +1320,7 @@ async def rejudge_submission(
     submission_data = cursor.fetchone()
 
     if not submission_data:
+        conn.close()
         raise HTTPException(status_code=404, detail="评测不存在")
 
     id, problem_id, user_id, language, code = submission_data
@@ -1276,7 +1333,7 @@ async def rejudge_submission(
         code=code,
         status=SubmissionStatus.PENDING,
         score=10,
-        count=0,
+        counts=0,
     )
 
     cursor.execute(
@@ -1284,12 +1341,14 @@ async def rejudge_submission(
         UPDATE submissions 
         SET status = ?, 
             teststatus = NULL, 
-            count = 0,
+            counts = 0,
             create_time = ? 
         WHERE id = ?
     """,
         (SubmissionStatus.PENDING, datetime.now().isoformat(), submission_id),
     )
+    conn.commit()
+    conn.close()
 
     threading.Thread(target=run_judge_in_background, args=(problem_id, id)).start()
     return {
@@ -1299,8 +1358,203 @@ async def rejudge_submission(
     }
 
 
+@app.get("/api/submissions/{submission_id}/log")
+async def get_submission_log(submission_id: str, request: Request):
+    """获取提交日志"""
+
+    session_id = request.cookies.get("session_id")
+
+    if not session_id:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO access_logs (user_id, problem_id, action, time, status)
+               VALUES (?, ?, ?, ?, ?)""",
+            (None, None, "view_log", datetime.now().strftime("%Y-%m-%d"), "401"),
+        )
+        conn.commit()
+        conn.close()
+
+        raise HTTPException(status_code=401, detail="用户未登录")
+
+    current_user = get_current_user(request)
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM submissions WHERE id = ?", (submission_id,))
+    data = cursor.fetchone()
+
+    if not data:
+        cursor.execute(
+            """INSERT INTO access_logs (user_id, problem_id, action, time, status)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                current_user.user_id,
+                None,
+                "view_log",
+                datetime.now().strftime("%Y-%m-%d"),
+                "404",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=404, detail="评测不存在")
+
+    test = json.loads(data[6])
+
+    teststatus = [Result(**item) for item in test] if test else []
+
+    submission = Submission(
+        id=data[0],
+        problem_id=data[1],
+        user_id=data[2],
+        language=data[3],
+        code=data[4],
+        status=data[5],
+        teststatus=teststatus,
+        score=data[7],
+        counts=data[8],
+        create_time=data[9],
+    )
+
+    if (
+        submission.user_id != current_user.user_id
+        and not current_user.role == UserRole.ADMIN
+    ):
+        cursor.execute(
+            """INSERT INTO access_logs (user_id, problem_id, action, time, status)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                current_user.user_id,
+                submission.problem_id,
+                "view_log",
+                datetime.now().strftime("%Y-%m-%d"),
+                "403",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=403, detail="权限不足")
+
+    cursor.execute(
+        """INSERT INTO access_logs (user_id, problem_id, action, time, status)
+               VALUES (?, ?, ?, ?, ?)""",
+        (
+            current_user.user_id,
+            submission.problem_id,
+            "view_log",
+            datetime.now().strftime("%Y-%m-%d"),
+            "200",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "code": 200,
+        "msg": "success",
+        "data": {
+            "details": submission.teststatus,
+            "score": submission.score,
+            "counts": submission.counts,
+        },
+    }
+
+
+@app.put("/api/problems/{problem_id}/log_visibility")
+async def alter_visibility(
+    public_cases: bool, problem_id: str, current_user: User = Depends(is_admin)
+):
+    """修改题目测试点的可见性"""
+    file_path = get_problem_path(problem_id)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="题目不存在")
+
+    with open(file_path, "r+", encoding="utf-8") as f:
+        problem = Problem(**json.load(f))
+
+    problem.is_public = public_cases
+
+    tmp = ""
+
+    if (
+        public_cases == True
+    ):  # 用字符串传入返回值，不然可能显示的格式不对，比如true或者1 # TODO:有点烂
+        tmp = "True"
+    else:
+        tmp = "False"
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(problem.model_dump(), f)
+
+    return {
+        "code": 200,
+        "msg": "success",
+        "data": {"problem_id": problem.id, "public_cases": tmp},
+    }
+
+
+@app.get("/api/logs/access/")
+async def list_access_logs(
+    user_id: Optional[str] = Query(None, description="Filter by user ID"),
+    problem_id: Optional[str] = Query(None, description="Filter by problem ID"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    current_user: User = Depends(is_admin),
+):
+    """获取访问审计日志列表"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+
+    # 构建查询条件
+    conditions = []
+    params = []
+    if user_id:
+        conditions.append("user_id = ?")
+        params.append(user_id)
+    if problem_id:
+        conditions.append("problem_id = ?")
+        params.append(problem_id)
+
+    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+    # 查询总数
+    cursor.execute(f"SELECT COUNT(*) FROM access_logs {where_clause}", params)
+    total = cursor.fetchone()[0]
+
+    # 查询日志
+    offset = (page - 1) * page_size
+    cursor.execute(
+        f"""SELECT user_id, problem_id, action, time, status 
+            FROM access_logs 
+            {where_clause} 
+            ORDER BY time DESC 
+            LIMIT ? OFFSET ?""",
+        [*params, page_size, offset],
+    )
+    logs = cursor.fetchall()
+
+    conn.close()
+
+    return {
+        "code": 200,
+        "msg": "success",
+        "data": [
+            {
+                "user_id": log[0],
+                "problem_id": log[1],
+                "action": log[2],
+                "time": log[3],
+                "status": log[4],
+            }
+            for log in logs
+        ],
+    }
+
+
 @app.post("/api/reset/")
 async def reset(current_user: User = Depends(is_admin)):
+    """清除数据，删除app.db，删除sessions和problems目录下的所有文件，重建用户表、提交表和访问日志表，并初始化管理员账号"""
     os.remove(DATABASE_PATH)
     with open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\users\user_count.txt",
@@ -1320,23 +1574,21 @@ async def reset(current_user: User = Depends(is_admin)):
         item_path = os.path.join(SESSIONS_DIR, item)
         os.remove(item_path)
 
-    for item in os.listdir(SESSIONS_DIR):
-        item_path = os.path.join(SESSIONS_DIR, item)
-        os.remove(item_path)
-
     for item in os.listdir(PROBLEMS_DIR):
         item_path = os.path.join(PROBLEMS_DIR, item)
         os.remove(item_path)
 
     create_user_table()
     create_submission_table()
+    create_access_log_table()
     init_admin_account()
 
-    return {"code": 200, "msg": "system reset successfully", "data": "null"}
+    return {"code": 200, "msg": "system reset successfully", "data": None}
 
 
 @app.get("/api/export")
 async def export(current_user: User = Depends(is_admin)):
+    """导出数据"""
     try:
 
         conn = sqlite3.connect(DATABASE_PATH)
@@ -1366,7 +1618,10 @@ async def export(current_user: User = Depends(is_admin)):
 
 
 def import_problem(problem: Problem):
-    pass
+    """导入题目数据，冲突时更新"""
+    file_path = get_problem_path(problem.id)
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(problem.model_dump(), f)
 
 
 def import_user(user: User):
@@ -1414,9 +1669,9 @@ def import_user(user: User):
                 user.user_id,
             ),
         )
-
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def import_submission(submission: Submission):
@@ -1428,7 +1683,7 @@ def import_submission(submission: Submission):
 
         cursor.execute(
             """
-            INSERT INTO submissions (id, problem_id, user_id, language, code, status, teststatus, score, count, create_time)
+            INSERT INTO submissions (id, problem_id, user_id, language, code, status, teststatus, score, counts, create_time)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -1440,7 +1695,7 @@ def import_submission(submission: Submission):
                 submission.status,
                 teststatus_json,
                 submission.score,
-                submission.count,
+                submission.counts,
                 submission.create_time,
             ),
         )
@@ -1457,7 +1712,7 @@ def import_submission(submission: Submission):
                 status = ?,
                 teststatus = ?,
                 score = ?,
-                count = ?,
+                counts = ?,
                 create_time = ?
             WHERE id = ?
             """,
@@ -1469,23 +1724,37 @@ def import_submission(submission: Submission):
                 submission.status,
                 teststatus_json,
                 submission.score,
-                submission.count,
+                submission.counts,
                 submission.create_time,
                 submission.id,
             ),
         )
+        conn.commit()
+    finally:
+        conn.close()
 
-    conn.commit()
-    conn.close()
+
+def get_file(file: UploadFile = File(None)):
+    """获取上传的文件,专门处理文件为空的情况"""
+    if file is None:
+        raise HTTPException(status_code=400, detail="参数错误")
+    return file
 
 
 @app.post("/api/import/")
-async def impo(file: UploadFile = File(...), current_user: User = Depends(is_admin)):
+async def impo(
+    file: UploadFile = Depends(get_file), current_user: User = Depends(is_admin)
+):
+    """导入数据"""
     if not file.filename.endswith(".json"):
         raise HTTPException(status_code=400, detail="Only JSON files supported")
 
     content = await file.read()
-    data = json.loads(content.decode("utf-8"))
+
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except JSONDecodeError:
+        raise HTTPException(status_code=400, detail="参数错误")
 
     type = 0
 
@@ -1514,7 +1783,7 @@ async def impo(file: UploadFile = File(...), current_user: User = Depends(is_adm
             # 处理Submission类型数据
             import_submission(submission)
 
-        return {"code": 200, "msg": "import success", "data": "null"}
+        return {"code": 200, "msg": "import success", "data": None}
     except Exception:
 
         raise HTTPException(status_code=500, detail="服务器异常")
