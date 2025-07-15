@@ -26,6 +26,8 @@ import uuid
 import sqlite3
 from json import JSONDecodeError
 from fastapi.responses import JSONResponse
+import ast
+import aiofiles
 
 DATABASE_PATH = "app.db"
 
@@ -174,7 +176,6 @@ def get_user_by_username(username: str):
     cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
     user_data = cursor.fetchone()
     conn.close()
-
     if user_data:
         return {
             "user_id": user_data[0],
@@ -195,7 +196,6 @@ def get_user_by_user_id(user_id: str):
     cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     user_data = cursor.fetchone()
     conn.close()
-
     if user_data:
         return {
             "user_id": user_data[0],
@@ -216,7 +216,6 @@ def create_initadmin(user_id: str, username: str, password: str, role: UserRole)
     )
     now = datetime.now()
     join_time = now.strftime("%Y-%m-%d")
-
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     try:
@@ -230,7 +229,6 @@ def create_initadmin(user_id: str, username: str, password: str, role: UserRole)
         raise HTTPException(status_code=400, detail="用户名已存在")
     finally:
         conn.close()
-
     return {
         "user_id": user_id,
         "username": username,
@@ -248,9 +246,7 @@ def init_admin_account():
     existing_admin = get_user_by_username(admin_username)
     if existing_admin:
         return
-
     user_id = get_next_user_id()
-
     if not get_user_by_username(admin_username):
         create_initadmin(
             user_id=user_id,
@@ -282,22 +278,17 @@ init_admin_account()  # 初始化管理员
 def get_current_user(request: Request):
     """通过当前状态，获取当前用户"""
     session_id = request.cookies.get("session_id")
-
     if not session_id:
         raise HTTPException(status_code=401, detail="用户未登录")
-
     session_file = os.path.join(SESSIONS_DIR, f"{session_id}.json")
     if not os.path.exists(session_file):
         raise HTTPException(status_code=401, detail="Invalid session")
-
     with open(session_file, "r") as f:
-        session_data = json.load(f)
+        session_data = json.loads(f.read())
 
-    # 验证用户是否存在
     user_data = get_user_by_username(session_data["username"])
     if not user_data:
         raise HTTPException(status_code=404, detail="用户不存在")
-
     if user_data["role"] == UserRole.BANNED:
         raise HTTPException(status_code=403, detail="用户无权限")
 
@@ -334,7 +325,6 @@ async def login(response: Response, request: dict):
     user_data = cursor.fetchone()
     conn.close()
 
-    # 验证用户是否存在
     if not user_data:
         raise HTTPException(status_code=401, detail="用户名或密码错误")
 
@@ -351,16 +341,16 @@ async def login(response: Response, request: dict):
     session_id = str(uuid.uuid4())
     session_file = os.path.join(SESSIONS_DIR, f"{session_id}.json")
 
-    with open(session_file, "w") as f:
-        json.dump(
+    async with aiofiles.open(session_file, "w") as f:
+        session_data = json.dumps(
             {
                 "user_id": user_id,
                 "username": username,
                 "role": role,
                 "created_at": datetime.now().isoformat(),
             },
-            f,
         )
+        await f.write(session_data)
 
     response.set_cookie(key="session_id", value=session_id, httponly=True)
 
@@ -378,9 +368,7 @@ async def login(response: Response, request: dict):
 @app.post("/api/auth/logout")
 async def logout(request: Request, response: Response):
     """用户登出"""
-    # 直接从cookie获取session_id
-    session_id = request.cookies.get("session_id")
-
+    session_id = request.cookies.get("session_id")  # 直接从cookie获取session_id
     if session_id:
         session_file = os.path.join(SESSIONS_DIR, f"{session_id}.json")
         if os.path.exists(session_file):
@@ -389,9 +377,7 @@ async def logout(request: Request, response: Response):
             raise HTTPException(status_code=401, detail="未登录")
     else:
         raise HTTPException(status_code=401, detail="未登录")
-
-    # 清除客户端cookie
-    response.delete_cookie(key="session_id")
+    response.delete_cookie(key="session_id")  # 删除cookie
 
     return {"code": 200, "msg": "logout success", "data": None}
 
@@ -500,9 +486,7 @@ async def get_user(user_id: str, current_user: User = Depends(get_current_user))
     }
 
 
-class UpdateUserRole(BaseModel):
-    """更新用户角色的请求体"""
-
+class UpdateUserRole(BaseModel):  # 更新用户角色的请求体
     role: UserRole
 
 
@@ -543,7 +527,6 @@ async def list_users(
     current_user: User = Depends(is_admin),
 ):
     """获取用户列表"""
-
     if page is not None and page_size is None:
         raise HTTPException(status_code=400, detail="参数错误")
 
@@ -557,7 +540,6 @@ async def list_users(
     cursor = conn.cursor()
 
     try:
-
         cursor.execute("SELECT COUNT(*) FROM users")
         total = cursor.fetchone()[0]
         if page is not None:
@@ -576,7 +558,6 @@ async def list_users(
                 "ORDER BY join_time DESC"
             )
         users_data = cursor.fetchall()
-
     finally:
         conn.close()
 
@@ -658,8 +639,8 @@ async def list_problems():
     for filename in os.listdir(PROBLEMS_DIR):
         if filename.endswith(".json"):
             path = os.path.join(PROBLEMS_DIR, filename)
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            async with aiofiles.open(path, "r", encoding="utf-8") as f:
+                data = json.loads(await f.read())
                 problems.append({"id": data["id"], "title": data["title"]})
     return {"code": 200, "msg": "success", "data": problems}
 
@@ -676,8 +657,9 @@ async def create_problem(problem: dict, user: User = Depends(get_current_user)):
         raise HTTPException(status_code=409, detail="id已存在")
 
     problem_data = problem.model_dump()
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(problem_data, f)
+    async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+        tmpdata = json.dumps(problem_data)
+        await f.write(tmpdata)
 
     return {"code": 200, "msg": "add success", "data": {"id": problem.id}}
 
@@ -700,8 +682,8 @@ async def get_problem(problem_id: str, user: User = Depends(get_current_user)):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="题目不存在")
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+        data = json.loads(await f.read())
 
     if data["is_public"] == False and user.role != UserRole.ADMIN:
         data.pop("testcases", None)
@@ -722,7 +704,6 @@ class Language(BaseModel):  # 语言类
 @app.post("/api/languages/")
 async def register_language(request: dict, current_user: User = Depends(is_admin)):
     """注册新编程语言"""
-
     try:
         request = Language(**request)
     except ValidationError:
@@ -731,8 +712,9 @@ async def register_language(request: dict, current_user: User = Depends(is_admin
     file_path = get_language_path(request.name)
 
     lang_config = request.model_dump()
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(lang_config, f)
+    async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+        tmpdata = json.dumps(lang_config)
+        await f.write(tmpdata)
 
     return {
         "code": 200,
@@ -748,8 +730,8 @@ async def list_languages():
     for filename in os.listdir(LANGUAGES_DIR):
         if filename.endswith(".json"):
             path = os.path.join(LANGUAGES_DIR, filename)
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            async with aiofiles.open(path, "r", encoding="utf-8") as f:
+                data = json.loads(await f.read())
                 languages["name"].append(data["name"])
     return {"code": 200, "msg": "success", "data": languages}
 
@@ -827,7 +809,6 @@ def run_process(
             pass
 
     try:
-
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -837,7 +818,6 @@ def run_process(
             text=True,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-
         monitor_thread = threading.Thread(target=memory_monitor, args=(process.pid,))
         monitor_thread.daemon = True
         monitor_thread.start()
@@ -852,9 +832,7 @@ def run_process(
             stdout, stderr = process.communicate()
 
         monitor_thread.join(timeout=0.1)
-
         run_time = time.time() - start_time
-
         memory_used = max_memory / (1024 * 1024) if max_memory > 0 else 0
 
         return stdout, run_time, memory_used, timed_out or memory_exceeded
@@ -865,10 +843,8 @@ def run_process(
 
 def normalize_output(output: str):
     """标准化输出：移除末尾空白和多余换行"""
-    # 移除每行末尾空白
-    lines = [line.rstrip() for line in output.splitlines()]
-    # 移除末尾空行
-    while lines and lines[-1] == "":
+    lines = [line.rstrip() for line in output.splitlines()]  # 移除每行末尾空白
+    while lines and lines[-1] == "":  # 移除末尾空行
         lines.pop()
     return "\n".join(lines) + "\n" if lines else ""
 
@@ -879,7 +855,6 @@ def spj(problem_id: int, stdout: str, output: str):
         return False
 
     with tempfile.TemporaryDirectory(dir=TEMP_DIR) as temp_dir:
-
         user_output_file = os.path.join(temp_dir, "user_output.txt")
         std_output_file = os.path.join(temp_dir, "std_output.txt")
         result_file = os.path.join(temp_dir, "result.txt")
@@ -916,7 +891,6 @@ def spj(problem_id: int, stdout: str, output: str):
             if result.returncode != 0:
                 return False
 
-            # 读取结果文件
             if not os.path.exists(result_file):
                 return False
 
@@ -972,9 +946,7 @@ def judge_submission(problem: Problem, code: str, language: str):
 
         executable_path = None
         if lang_config.compile_cmd:
-
             executable_path = os.path.join(work_dir, "main")
-
             compile_cmd = lang_config.compile_cmd.format(
                 src=source_path, exe=executable_path
             ).split()
@@ -1042,12 +1014,10 @@ def judge_submission(problem: Problem, code: str, language: str):
             result = Result(id=idx + 1, result=TestStatus.ACCEPTED)
 
             try:
-                # 运行并监控进程
                 stdout, run_time, memory_used, resource_exceeded = run_process(
                     run_cmd, test_case.input, time_limit, memory_limit, work_dir
                 )
 
-                # 检查资源使用情况
                 if resource_exceeded:
                     if memory_used > memory_limit:
                         result.result = TestStatus.MEMORY_LIMIT_EXCEEDED
@@ -1060,7 +1030,6 @@ def judge_submission(problem: Problem, code: str, language: str):
                         result.memory = memory_used
 
                     test_status.append(result)
-
                     continue
 
                 # 检查运行结果
@@ -1180,7 +1149,6 @@ def run_judge_in_background(submission_problem_id: str, submission_id: str):
 @app.post("/api/submissions/")
 async def submit_code(request: dict, current_user: User = Depends(get_current_user)):
     """提交代码"""
-
     try:
         request = CreateSubmission(**request)
     except ValidationError:
@@ -1192,7 +1160,6 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
 
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-
     cursor.execute(
         """
             SELECT create_time 
@@ -1216,22 +1183,22 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
 
     conn.close()
 
-    file = open(
+    async with aiofiles.open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\app\count.txt",
         "r+",
         encoding="utf-8",
-    )
-    content = int(file.read())
-    file.seek(0)
-    file.truncate()
-    content += 1
+    ) as file:
+        content = int(await file.read())
+        await file.seek(0)
+        await file.truncate()
+        content += 1
+        await file.write(str(content))
 
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     create_time = datetime.now().isoformat()
     try:
         # 插入提交记录（初始状态为pending）
-
         cursor.execute(
             """
         INSERT INTO submissions 
@@ -1249,7 +1216,6 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
                 create_time,
             ),
         )
-
         cursor.execute(
             """
             UPDATE users 
@@ -1274,8 +1240,6 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
         counts=0,
         create_time=create_time,
     )
-    file.write(str(content))
-    file.close()
 
     # 启动后台评测任务
     threading.Thread(
@@ -1331,10 +1295,8 @@ def get_submissions(
     page_size: Optional[int] = None,
 ) -> Tuple[int, List[Submission]]:
     """获取提交列表"""
-
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-
     cursor.execute(
         """
             SELECT id, problem_id, user_id, language, code, status, teststatus, score, counts,create_time
@@ -1409,7 +1371,6 @@ async def list_submissions(
     current_user: User = Depends(get_current_user),
 ):
     """获取提交列表"""
-
     if current_user.role != UserRole.ADMIN:
         if user_id is not None and user_id != current_user.user_id:
             raise HTTPException(status_code=403, detail="用户无权限")
@@ -1517,9 +1478,7 @@ async def rejudge_submission(
 @app.get("/api/submissions/{submission_id}/log")
 async def get_submission_log(submission_id: str, request: Request):
     """获取提交日志"""
-
     session_id = request.cookies.get("session_id")
-
     if not session_id:
         raise HTTPException(status_code=401, detail="用户未登录")
 
@@ -1531,7 +1490,6 @@ async def get_submission_log(submission_id: str, request: Request):
     data = cursor.fetchone()
 
     if not data:
-
         raise HTTPException(status_code=404, detail="评测不存在")
 
     test = json.loads(data[6])
@@ -1608,13 +1566,14 @@ async def alter_visibility(
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="题目不存在")
 
-    with open(file_path, "r+", encoding="utf-8") as f:
-        problem = Problem(**json.load(f))
+    async with aiofiles.open(file_path, "r+", encoding="utf-8") as f:
+        problem = Problem(**json.loads(await f.read()))
 
     problem.is_public = request.public_cases
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(problem.model_dump(), f)
+    async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+        tmpdata = json.dumps(problem.model_dump())
+        await f.write(tmpdata)
 
     return {
         "code": 200,
@@ -1632,7 +1591,6 @@ async def list_access_logs(
     current_user: User = Depends(is_admin),
 ):
     """获取访问审计日志列表"""
-
     if user_id is None and problem_id is None:
         raise HTTPException(status_code=400, detail="参数错误")
 
@@ -1659,10 +1617,6 @@ async def list_access_logs(
         params.append(problem_id)
 
     where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
-
-    # 查询总数
-    cursor.execute(f"SELECT COUNT(*) FROM access_logs {where_clause}", params)
-    total = cursor.fetchone()[0]
 
     # 查询日志
     if page is not None:
@@ -1707,19 +1661,19 @@ async def list_access_logs(
 async def reset(current_user: User = Depends(is_admin)):
     """清除数据，删除app.db，删除sessions和problems目录下的所有文件，重建用户表、提交表和访问日志表，并初始化管理员账号"""
     os.remove(DATABASE_PATH)
-    with open(
+    async with aiofiles.open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\users\user_count.txt",
         "w",
         encoding="utf-8",
     ) as f:
-        f.write(str(0))
+        await f.write(str(0))
 
-    with open(
+    async with aiofiles.open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\app\count.txt",
         "w",
         encoding="utf-8",
     ) as file:
-        file.write(str(0))
+        await file.write(str(0))
 
     for item in os.listdir(SESSIONS_DIR):
         item_path = os.path.join(SESSIONS_DIR, item)
@@ -1748,14 +1702,11 @@ async def reset(current_user: User = Depends(is_admin)):
 async def export(current_user: User = Depends(is_admin)):
     """导出数据"""
     try:
-
         conn = sqlite3.connect(DATABASE_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-
         cursor.execute("SELECT * FROM users")
         users = [dict(row) for row in cursor.fetchall()]
-
         cursor.execute("SELECT * FROM submissions")
         submissions = [dict(row) for row in cursor.fetchall()]
         conn.close()
@@ -1765,8 +1716,8 @@ async def export(current_user: User = Depends(is_admin)):
         for filename in os.listdir(PROBLEMS_DIR):
             if filename.endswith(".json"):
                 path = os.path.join(PROBLEMS_DIR, filename)
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                async with aiofiles.open(path, "r", encoding="utf-8") as f:
+                    data = json.loads(await f.read())
                     problems.append(data)
 
         return {
@@ -1779,20 +1730,19 @@ async def export(current_user: User = Depends(is_admin)):
         raise HTTPException(status_code=500, detail="服务器服务异常")
 
 
-def import_problem(problem: Problem):
+async def import_problem(problem: Problem):
     """导入题目数据，冲突时更新"""
     file_path = get_problem_path(problem.id)
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(problem.model_dump(), f)
+    async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+        tmpdata = json.dumps(problem.model_dump())
+        await f.write(tmpdata)
 
 
 def import_user(user: User):
     """导入用户数据，冲突时更新"""
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
-
     try:
-
         cursor.execute(
             """
             INSERT INTO users (user_id, username, password, join_time, role, submit_count, resolve_count)
@@ -1810,7 +1760,6 @@ def import_user(user: User):
         )
         conn.commit()
     except sqlite3.IntegrityError:
-
         cursor.execute(
             """
             UPDATE users
@@ -1843,7 +1792,6 @@ def import_submission(submission: Submission):
     cursor = conn.cursor()
     teststatus_json = json.dumps([r.model_dump() for r in submission.teststatus])
     try:
-
         cursor.execute(
             """
             INSERT INTO submissions (id, problem_id, user_id, language, code, status, teststatus, score, counts, create_time)
@@ -1865,7 +1813,6 @@ def import_submission(submission: Submission):
         conn.commit()
 
     except sqlite3.IntegrityError:
-
         cursor.execute(
             """
             UPDATE submissions
@@ -1927,8 +1874,7 @@ async def impo(
     ):  # TODO:两种情况的导入，一种是ci里的情况，一种是直接一个json就是一个某对象的数据，如果没必要以后可以删了
         try:
             problem = Problem(**data)
-            import_problem(problem)
-
+            await import_problem(problem)
         except Exception:
             try:
                 password_plaintext = data.pop("password")
@@ -1941,12 +1887,10 @@ async def impo(
                 data["password"] = password_hash
                 user = User(**data)
                 import_user(user)
-
             except Exception:
                 try:
                     submission = Submission(**data)
                     import_submission(submission)
-
                 except Exception:
                     raise HTTPException(status_code=400, detail="参数错误")
     else:
@@ -1962,11 +1906,8 @@ async def impo(
                         ).decode("utf-8")
                     else:
                         password_hash = password_plaintext
-
                     user_data["password"] = password_hash
-
                     user = User(**user_data)
-
                     import_user(user)
                 except Exception:
                     raise HTTPException(status_code=400, detail="参数错误")
@@ -1974,9 +1915,8 @@ async def impo(
             for problem_data in data["problems"]:
                 try:
                     problem = Problem(**problem_data)
-                    import_problem(problem)
+                    await import_problem(problem)
                 except Exception:
-
                     raise HTTPException(status_code=400, detail="参数错误")
         if "submissions" in data:
             for submission_data in data["submissions"]:
@@ -1987,6 +1927,20 @@ async def impo(
                     raise HTTPException(status_code=400, detail="参数错误")
 
     return {"code": 200, "msg": "import success", "data": None}
+
+
+whitelist = {
+    "math",
+    "random",
+    "collections",
+    "heapq",
+    "bisect",
+    "array",
+    "itertools",
+    "functools",
+    "operator",
+    "numpy",
+}
 
 
 @app.post("/api/problems/{problem_id}/spj")
@@ -2006,8 +1960,32 @@ async def upload_spj(
     spj_path = os.path.join(PROBLEMS_DIR, problem_id, "spj.py")
     if os.path.exists(spj_path):
         raise HTTPException(status_code=409, detail="脚本已存在")
-    with open(spj_path, "wb") as f:
-        f.write(await file.read())
+
+    content = await file.read()
+
+    # 进行导入模块检查
+    try:
+        tree = ast.parse(content)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for name in node.names:
+                    module_name = name.name.split(".")[0]
+                    if module_name not in whitelist:
+                        raise HTTPException(
+                            status_code=400, detail=f"不允许导入模块: {module_name}"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    module_name = node.module.split(".")[0]
+                    if module_name not in whitelist:
+                        raise HTTPException(
+                            status_code=400, detail=f"不允许导入模块: {module_name}"
+                        )
+    except SyntaxError as e:
+        raise HTTPException(status_code=400, detail=f"脚本语法错误: {str(e)}")
+
+    async with aiofiles.open(spj_path, "wb") as f:
+        await f.write(await file.read())
 
     return {"code": 200, "msg": "SPJ script uploaded successfully", "data": None}
 
