@@ -20,7 +20,7 @@ import psutil
 import time
 import signal
 from typing import Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import bcrypt
 import uuid
 import sqlite3
@@ -758,7 +758,7 @@ class Submission(BaseModel):  # 提交类
     teststatus: List[Result] = []  # 测试结果列表
     score: int = 0
     counts: int
-    create_time: Optional[str] = None
+    create_time: Optional[str] = datetime.now().isoformat()
 
 
 class JudgeResult(BaseModel):  # 评测结果类
@@ -1158,30 +1158,24 @@ async def submit_code(request: dict, current_user: User = Depends(get_current_us
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="题目不存在")
 
+    timelimit = (datetime.now() - timedelta(minutes=1)).isoformat()
+
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     cursor.execute(
         """
-            SELECT create_time 
+            SELECT COUNT(*) 
             FROM submissions 
             WHERE user_id = ? 
-            ORDER BY id DESC 
-            LIMIT 1
+            AND create_time >= ?
         """,
-        (current_user.user_id,),
+        (current_user.user_id, timelimit),
     )
-    last_submission = cursor.fetchone()
-    if last_submission:
-        lasttime = last_submission[0]
-        if lasttime is not None:
-            lasttime = datetime.fromisoformat(lasttime)
-            currenttime = datetime.now()
-            interval = (currenttime - lasttime).total_seconds()
-            if interval < 5:
-                conn.close()
-                raise HTTPException(status_code=429, detail="提交频率超限")
-
+    recent_submissions_count = cursor.fetchone()[0]
     conn.close()
+
+    if recent_submissions_count >= 3:
+        raise HTTPException(status_code=429, detail="提交频率超限")
 
     async with aiofiles.open(
         r"C:\Users\14395\Desktop\git\pa2-oj-2024010702\app\count.txt",
