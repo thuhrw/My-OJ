@@ -118,7 +118,7 @@ def http_exception_handler(request, exc):
         status_code=exc.status_code,
         content={
             "code": exc.status_code,  # 将状态码添加到响应体
-            "msg": "error",
+            "msg": exc.detail,
             "data": None,
         },
     )
@@ -1535,7 +1535,6 @@ async def get_submission_log(submission_id: str, request: Request):
     )
     conn.commit()
     conn.close()
-
     return {
         "code": 200,
         "msg": "success",
